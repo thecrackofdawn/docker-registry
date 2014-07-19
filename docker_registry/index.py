@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
 
 import logging
+import os
+import glob
+from docker_registry.core import compat
+json = compat.json
 
+from stdlog import stdlog
 import flask
 import flask_cors
 
@@ -13,6 +18,7 @@ from . import storage
 from . import toolkit
 from .lib import mirroring
 from .lib import signals
+from search import INDEX
 
 from .app import app
 
@@ -127,7 +133,60 @@ def get_repository_images(namespace, repository):
 def delete_repository_images(namespace, repository):
     # Does nothing, this file will be removed when DELETE on repos
     headers = generate_headers(namespace, repository, 'delete')
-    return toolkit.response('', 204, headers)
+    result, code = 'ok', 200
+    if ':' in repository:
+        try:
+            repository, tag = repository.split(":")
+        except ValueError:
+            result, code = 'illegal repository format', 400
+            return toolkit.response(result, code, headers)
+    else:
+        tag = ''
+    repo_path = store.repository_path(namespace, repository)  
+    if not store.exists(repo_path):
+        result, code = "%s not exists"%repo_path, 404
+        return toolkit.response(result, code, headers)
+
+    def delete_tag(tag):
+        tag_path = store.tag_path(namespace, repository, tag)
+        try:
+            repo_id = store.get_content(tag_path)
+        except exceptions.FileNotFoundError:
+            result, code = 'tag {0} not found'.format(tag), 404
+            return result, code
+        path = store.image_ancestry_path(repo_id)
+        related_ids = json.loads(store.get_content(path))
+        #related_ids.append(repo_id)
+        #store.remove(os.path.join(store.images, repo_id))
+        store.remove(repo_path)
+        needed_ids = set()
+        for repo in os.listdir(store._init_path(store.repository_path(namespace, ''))):
+            stdlog.debug('repo:'+repr(repo))
+            ids = json.loads(store.get_content(store.index_images_path(namespace, repo)))
+            ids = set(item['id'] for item in ids)
+            needed_ids.update(ids)
+        stdlog.debug('used:'+repr(needed_ids))
+        stdlog.debug('to delete:'+ repr(related_ids))
+        for image_id in related_ids:
+            if not image_id in needed_ids:
+                stdlog.debug('deleting:'+repr(image_id))    
+                store.remove(os.path.join(store.images, image_id))
+        return 'ok', 200
+
+    all_tags = glob.glob(store._init_path(os.path.join(repo_path, 'tag_*')))
+    if tag:
+        stdlog.debug('tag:'+repr(tag))
+        result, code = delete_tag(tag)
+        if len(all_tags) == 1 and code == 200 and INDEX:
+            INDEX._handle_repository_deleted(None, namespace, repository)
+    else:
+        if INDEX:
+            INDEX._handle_repository_deleted(None, namespace, repository)
+        for tag in all_tags:
+            stdlog.debug(repr(tag))
+            tag = tag.split('_')[-1] 
+            delete_tag(tag)
+    return toolkit.response(result, code, headers)
 
 
 @app.route('/v1/repositories/<path:repository>/auth', methods=['PUT'])
